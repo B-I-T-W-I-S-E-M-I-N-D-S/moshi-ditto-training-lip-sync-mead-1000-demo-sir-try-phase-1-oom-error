@@ -1,0 +1,129 @@
+# ============================================================
+# Bridge-Ditto Training Configuration
+# ============================================================
+# GPU Target: 4× RTX 5090 (32 GB each) on RunPod
+#
+# This config is used by the shell scripts. The actual training
+# uses tyro CLI arguments (same as original Ditto train.py).
+# This file documents the recommended settings.
+# ============================================================
+
+# ── Model Paths ──────────────────────────────────────────────
+paths:
+  # Bridge module (for feature extraction only — NOT trained)
+  bridge_ckpt: "checkpoints/bridge_best.pt"
+  bridge_config: "bridge_module/config.yaml"
+
+  # Mimi encoder (for feature extraction only — NOT trained)
+  mimi_model: "kyutai/moshiko-pytorch-bf16"
+
+  # Ditto training checkpoints
+  ditto_pytorch_path: "checkpoints/ditto_pytorch"
+
+# ── Data ─────────────────────────────────────────────────────
+data:
+  # HDTF dataset root (adjust to your RunPod path)
+  dataset_root: "/workspace/HDTF"
+
+  # data_info.json produced by prepare_data.sh
+  data_info_json: "/workspace/HDTF/data_info.json"
+
+  # Training data list (produced by gather_data_list_json_for_train.py)
+  data_list_json: "/workspace/HDTF/bridge_data_list_train.json"
+
+  # Preloaded pickle (optional, for faster training startup)
+  data_preload_pkl: "/workspace/HDTF/bridge_preload.pkl"
+
+  # Motion normalization stats
+  mtn_mean_var_npy: ""
+
+# ── Training Hyperparameters ─────────────────────────────────
+training:
+  # Experiment
+  experiment_name: "bridge_ditto_hdtf_v1"
+  experiment_dir: "experiments/s2"
+
+  # Audio feature dimension:
+  #   1024 (bridge only)
+  #   + 63  (source canonical keypoints, if use_sc=true)
+  #   + 8   (emotion, if use_emo=true)
+  #   + 2   (eye open, if use_eye_open=true)
+  #   + 6   (eye ball, if use_eye_ball=true)
+  #   = 1103 (with all conditioning)
+  audio_feat_dim: 1103
+
+  # Motion feature dimension (LivePortrait keypoints)
+  motion_feat_dim: 265
+
+  # Sequence length: 3.2 seconds * 25 FPS = 80 frames
+  seq_frames: 80
+
+  # Batch size per GPU (4 GPUs × 256 = 1024 effective)
+  # RTX 5090 has 32GB — can handle 256 per GPU easily
+  batch_size: 256
+
+  # Learning rate
+  lr: 1.0e-4
+
+  # Epochs
+  epochs: 1000
+
+  # Checkpoint save frequency
+  save_ckpt_freq: 50
+
+  # Data loading
+  num_workers: 4
+  data_preload: true
+  data_cache: false
+
+  # Use accelerate for multi-GPU
+  use_accelerate: true
+
+  # Conditioning signals
+  use_emo: true
+  use_eye_open: true
+  use_eye_ball: true
+  use_sc: true
+  use_last_frame: true
+  use_lmk: false
+  use_cond_end: false
+
+  # Loss
+  use_last_frame_loss: false
+  use_reg_loss: false
+
+# ── Feature Extraction ───────────────────────────────────────
+preprocessing:
+  # Number of GPUs for parallel feature extraction
+  num_gpus: 4
+
+  # Audio feature name key in data_info.json
+  # This replaces 'hubert_aud_npy_list' with 'bridge_aud_npy_list'
+  aud_feat_name: "bridge_aud_npy_list"
+
+  # Skip files that already have extracted features
+  skip_existing: true
+
+# ── Lip-Sync Loss (weak regularizer) ─────────────────────────
+lip_sync:
+  # Enable/disable SyncNet lip-sync loss
+  use_lip_sync_loss: true
+
+  # Loss weights (kept LOW to avoid dominating motion learning)
+  lip_sync_lambda1: 0.05       # L_sync = 1 - cos(A, V_pred)
+  lip_sync_lambda2: 0.02       # L_stable = |sim_gt - sim_pred|
+
+  # Efficiency controls
+  lip_sync_every_n_steps: 5    # compute every N steps (saves GPU)
+  lip_sync_batch_size: 2       # samples per batch for lip-sync
+  lip_sync_num_frames: 5       # consecutive frames for SyncNet window
+
+  # Warm-up: let base motion converge first
+  lip_sync_warmup_epochs: 30   # no lip-sync loss for first 30 epochs
+  lip_sync_use_stable: false   # disable L_stable initially
+  lip_sync_grad_clip: 0.1      # skip lip-sync step if loss > 2.0
+  lip_sync_debug: true         # ENABLE diagnostic logging + image saving
+
+  # Checkpoint paths
+  syncnet_checkpoint: "checkpoints/lipsync_expert.pth"
+  ditto_pytorch_path: "checkpoints/ditto_pytorch"
