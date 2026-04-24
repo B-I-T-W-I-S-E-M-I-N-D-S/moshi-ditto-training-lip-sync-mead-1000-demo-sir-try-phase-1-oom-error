@@ -27,9 +27,11 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────────────
 HDTF_ROOT="${1:-${HDTF_ROOT:-/workspace/HDTF}}"
 NUM_GPUS="${NUM_GPUS:-4}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-512}"        # A100: can handle 512/GPU comfortably
 EPOCHS="${EPOCHS:-1000}"
 LR="${LR:-1e-4}"
+NUM_WORKERS="${NUM_WORKERS:-4}"        # reduce if Bus error (Docker /dev/shm limit)
+MIXED_PRECISION="${MIXED_PRECISION:-bf16}"  # bf16 = ~2x faster on A100/H100
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-bridge_ditto_hdtf_v1}"
 AUDIO_FEAT_DIM="${AUDIO_FEAT_DIM:-1103}"
 MOTION_FEAT_DIM="${MOTION_FEAT_DIM:-265}"
@@ -41,8 +43,8 @@ MIN_FRAMES=$((SEQ_FRAMES + 1))
 USE_LIP_SYNC="${USE_LIP_SYNC:-1}"
 LIP_SYNC_LAMBDA1="${LIP_SYNC_LAMBDA1:-0.05}"
 LIP_SYNC_LAMBDA2="${LIP_SYNC_LAMBDA2:-0.02}"
-LIP_SYNC_EVERY_N="${LIP_SYNC_EVERY_N:-5}"
-LIP_SYNC_BATCH="${LIP_SYNC_BATCH:-2}"
+LIP_SYNC_EVERY_N="${LIP_SYNC_EVERY_N:-20}"  # every 20 steps = 5% overhead vs 20%
+LIP_SYNC_BATCH="${LIP_SYNC_BATCH:-4}"        # larger batch = better GPU utilization
 LIP_SYNC_WARMUP="${LIP_SYNC_WARMUP:-30}"
 LIP_SYNC_DEBUG="${LIP_SYNC_DEBUG:-1}"
 LIP_SYNC_USE_STABLE="${LIP_SYNC_USE_STABLE:-0}"
@@ -368,32 +370,16 @@ log "  GPUs: ${NUM_GPUS}, Batch/GPU: ${BATCH_SIZE}, Epochs: ${EPOCHS}"
 cd "${DITTO_TRAIN_DIR}"
 
 if [ "$NUM_GPUS" -gt 1 ]; then
-    log "Launching distributed training with accelerate..."
+    log "Launching distributed training on ${NUM_GPUS} GPUs via torchrun..."
+    log "  mixed_precision=${MIXED_PRECISION}  batch/GPU=${BATCH_SIZE}  workers=${NUM_WORKERS}"
 
-    accelerate launch \
-        --num_processes "${NUM_GPUS}" \
-        --mixed_precision no \
-        train_bridge_ditto.py \
-        --experiment_name "${EXPERIMENT_NAME}" \
-        --data_list_json "${DATA_LIST_JSON}" \
-        --data_preload \
-        --data_preload_pkl "${DATA_PRELOAD_PKL}" \
-        --audio_feat_dim "${AUDIO_FEAT_DIM}" \
-        --motion_feat_dim "${MOTION_FEAT_DIM}" \
-        --seq_frames "${SEQ_FRAMES}" \
-        --batch_size "${BATCH_SIZE}" \
-        --lr "${LR}" \
-        --epochs "${EPOCHS}" \
-        --save_ckpt_freq 50 \
-        --num_workers 4 \
-        --use_accelerate \
-        --use_emo \
-        --use_eye_open \
-        --use_eye_ball \
-        --use_sc \
-        --use_last_frame \
-        $([ "$USE_LIP_SYNC" -eq 1 ] && echo "\
-        --use_lip_sync_loss \
+    # bf16 / fp16 precision for A100/H100 — ~2x speed with no quality loss
+    export ACCELERATE_MIXED_PRECISION="${MIXED_PRECISION}"
+
+    # Build lipsync args once
+    LIPSYNC_ARGS=""
+    if [ "$USE_LIP_SYNC" -eq 1 ]; then
+        LIPSYNC_ARGS="--use_lip_sync_loss \
         --syncnet_checkpoint ${SYNCNET_CKPT} \
         --ditto_pytorch_path ${DITTO_PYTORCH_PATH} \
         --lip_sync_lambda1 ${LIP_SYNC_LAMBDA1} \
@@ -410,12 +396,39 @@ if [ "$NUM_GPUS" -gt 1 ]; then
         --lip_sync_delay_mode ${LIP_SYNC_DELAY_MODE} \
         --lip_sync_lambda1_warmup_epochs ${LIP_SYNC_LAMBDA1_WARMUP} \
         --lip_sync_delay_warmup_epochs ${LIP_SYNC_DELAY_WARMUP} \
-        --lip_landmark_warmup_epochs ${LIP_LANDMARK_WARMUP} \
-        $([ \"$LIP_SYNC_USE_DELAY_AWARE\" -eq 1 ] && echo '--lip_sync_use_delay_aware') \
-        $([ \"$LIP_SYNC_DEBUG\" -eq 1 ] && echo '--lip_sync_debug') \
-        $([ \"$LIP_SYNC_USE_STABLE\" -eq 1 ] && echo '--lip_sync_use_stable') \
-        $([ \"$USE_LIP_LANDMARK_LOSS\" -eq 1 ] && echo \"--use_lip_landmark_loss --lip_landmark_lambda ${LIP_LANDMARK_LAMBDA}\") \
-        $([ \"$LEGACY_DETACH\" -eq 1 ] && echo '--legacy_detach')")
+        --lip_landmark_warmup_epochs ${LIP_LANDMARK_WARMUP}"
+        [ "${LIP_SYNC_USE_DELAY_AWARE:-0}" -eq 1 ] && LIPSYNC_ARGS="$LIPSYNC_ARGS --lip_sync_use_delay_aware"
+        [ "${LIP_SYNC_DEBUG:-0}"           -eq 1 ] && LIPSYNC_ARGS="$LIPSYNC_ARGS --lip_sync_debug"
+        [ "${LIP_SYNC_USE_STABLE:-0}"      -eq 1 ] && LIPSYNC_ARGS="$LIPSYNC_ARGS --lip_sync_use_stable"
+        [ "${USE_LIP_LANDMARK_LOSS:-0}"    -eq 1 ] && LIPSYNC_ARGS="$LIPSYNC_ARGS --use_lip_landmark_loss --lip_landmark_lambda ${LIP_LANDMARK_LAMBDA}"
+        [ "${LEGACY_DETACH:-0}"            -eq 1 ] && LIPSYNC_ARGS="$LIPSYNC_ARGS --legacy_detach"
+    fi
+
+    torchrun \
+        --nproc_per_node="${NUM_GPUS}" \
+        --master_addr="127.0.0.1" \
+        --master_port="29500" \
+        train_bridge_ditto.py \
+        --experiment_name "${EXPERIMENT_NAME}" \
+        --data_list_json "${DATA_LIST_JSON}" \
+        --data_preload \
+        --data_preload_pkl "${DATA_PRELOAD_PKL}" \
+        --audio_feat_dim "${AUDIO_FEAT_DIM}" \
+        --motion_feat_dim "${MOTION_FEAT_DIM}" \
+        --seq_frames "${SEQ_FRAMES}" \
+        --batch_size "${BATCH_SIZE}" \
+        --lr "${LR}" \
+        --epochs "${EPOCHS}" \
+        --save_ckpt_freq 50 \
+        --num_workers "${NUM_WORKERS}" \
+        --use_accelerate \
+        --use_emo \
+        --use_eye_open \
+        --use_eye_ball \
+        --use_sc \
+        --use_last_frame \
+        $LIPSYNC_ARGS
+
 else
     python train_bridge_ditto.py \
         --experiment_name "${EXPERIMENT_NAME}" \

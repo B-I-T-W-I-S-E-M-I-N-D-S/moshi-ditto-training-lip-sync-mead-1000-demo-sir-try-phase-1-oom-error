@@ -49,15 +49,20 @@ class Trainer:
         opt = self.opt
         if opt.use_accelerate:
             from accelerate import Accelerator
-            self.accelerator       = Accelerator()
-            self.device            = self.accelerator.device
-            self.is_main_process   = self.accelerator.is_main_process
-            self.process_index     = self.accelerator.process_index
+            # Pick up ACCELERATE_MIXED_PRECISION env var (set to 'bf16' for A100/H100)
+            mixed_prec = os.environ.get('ACCELERATE_MIXED_PRECISION', 'no')
+            self.accelerator     = Accelerator(mixed_precision=mixed_prec)
+            self.device          = self.accelerator.device
+            self.is_main_process = self.accelerator.is_main_process
+            self.process_index   = self.accelerator.process_index
+            if self.is_main_process:
+                print(f"[Accelerator] mixed_precision={mixed_prec}  "
+                      f"device={self.device}  num_processes={self.accelerator.num_processes}")
         else:
-            self.accelerator       = None
-            self.device            = 'cuda'
-            self.is_main_process   = True
-            self.process_index     = 0
+            self.accelerator     = None
+            self.device          = 'cuda'
+            self.is_main_process = True
+            self.process_index   = 0
 
     def _set_accelerate(self):
         if self.accelerator is None:
@@ -120,15 +125,19 @@ class Trainer:
             use_lip_landmark_loss=opt.use_lip_landmark_loss,
         )
 
+        nw = opt.num_workers
         data_loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=opt.batch_size,
-            num_workers=opt.num_workers,
+            num_workers=nw,
             shuffle=True,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=(nw > 0),   # keep workers alive between epochs
+            prefetch_factor=(2 if nw > 0 else None),  # 2 batches ahead (shm-safe)
         )
         return data_loader
+
 
     def _init_optim(self):
         opt = self.opt
@@ -185,15 +194,15 @@ class Trainer:
             device=self.device,
             num_frames=opt.lip_sync_num_frames,
             max_shift=max_shift,
+            # Set LIP_SYNC_CPU_RENDER=1 env var only on small-VRAM GPUs (RTX 4090)
+            force_cpu_render=bool(int(os.environ.get('LIP_SYNC_CPU_RENDER', '0'))),
         )
-        # Note: FrozenRenderer is intentionally kept on CPU inside LipSyncLoss
-        # to avoid consuming GPU VRAM. Rendered frames (~4MB) are moved to GPU
-        # after rendering. No .half() needed — CPU fp16 is slower, not faster.
-        print(f"[LipSync] FrozenRenderer on CPU (GPU VRAM preserved for training).")
+        print(f"[LipSync] FrozenRenderer on {'CPU' if bool(int(os.environ.get('LIP_SYNC_CPU_RENDER','0'))) else 'GPU'}.")
         print(f"[LipSync] λ1={opt.lip_sync_lambda1}  λ2={opt.lip_sync_lambda2}  "
               f"delay_λ={opt.lip_sync_delay_lambda}  "
               f"hard_mode={opt.lip_sync_hard_mode}  "
               f"num_frames={opt.lip_sync_num_frames}  max_shift={max_shift}")
+
 
 
     # -----------------------------------------------------------------------

@@ -382,30 +382,38 @@ class Stage2Dataset(Dataset):
             else:
                 window_idx = min(window_idx, max_window)
 
-                # Lazily load the large arrays
-                data_dict['lipsync_f_s']           = np.load(arr_data['lipsync_f_s_path']).squeeze(0)
-                data_dict['lipsync_x_s']           = np.load(arr_data['lipsync_x_s_path']).squeeze(0)
-                data_dict['lipsync_kp_canonical']  = np.load(arr_data['lipsync_kp_canonical_path']).squeeze(0)
-                
-                data_dict['lipsync_A']             = A_arr[window_idx]
-                data_dict['lipsync_sim_gt']        = sim_gt_arr[window_idx]
-                data_dict['lipsync_t_start']       = t_start
-                data_dict['lipsync_valid']         = True
+                try:
+                    # Lazily load the large arrays on-demand
+                    data_dict['lipsync_f_s']          = np.load(arr_data['lipsync_f_s_path']).squeeze(0)
+                    data_dict['lipsync_x_s']          = np.load(arr_data['lipsync_x_s_path']).squeeze(0)
+                    data_dict['lipsync_kp_canonical'] = np.load(arr_data['lipsync_kp_canonical_path']).squeeze(0)
 
-                # Optional: landmark window for lip landmark loss
-                if self.use_lip_landmark_loss and self.use_lmk and 'lmk' in arr_data:
-                    v_lmk      = arr_data['lmk']  # (N, 478*3)
-                    lmk_start  = f_idx + t_start
-                    lmk_end    = lmk_start + T_sync
-                    if lmk_end <= len(v_lmk):
-                        data_dict['lipsync_lmk_window'] = v_lmk[lmk_start:lmk_end]  # (T, 478*3)
-                    else:
-                        # Pad with last frame
-                        avail = v_lmk[lmk_start:]
-                        pad   = np.stack(
-                            [v_lmk[-1]] * (T_sync - len(avail)), axis=0
-                        )
-                        data_dict['lipsync_lmk_window'] = np.concatenate([avail, pad], axis=0)
+                    data_dict['lipsync_A']            = A_arr[window_idx]
+                    data_dict['lipsync_sim_gt']       = sim_gt_arr[window_idx]
+                    data_dict['lipsync_t_start']      = t_start
+                    data_dict['lipsync_valid']        = True
+
+                    # Optional: landmark window for lip landmark loss
+                    if self.use_lip_landmark_loss and self.use_lmk and 'lmk' in arr_data:
+                        v_lmk      = arr_data['lmk']  # (N, 478*3)
+                        lmk_start  = f_idx + t_start
+                        lmk_end    = lmk_start + T_sync
+                        if lmk_end <= len(v_lmk):
+                            data_dict['lipsync_lmk_window'] = v_lmk[lmk_start:lmk_end]
+                        else:
+                            avail = v_lmk[lmk_start:]
+                            pad   = np.stack([v_lmk[-1]] * (T_sync - len(avail)), axis=0)
+                            data_dict['lipsync_lmk_window'] = np.concatenate([avail, pad], axis=0)
+
+                except Exception as _e:
+                    # Path is stale or file was deleted — mark invalid and warn once
+                    data_dict['lipsync_valid'] = False
+                    if not self._compat_warned:
+                        self._compat_warned = True
+                        _bad_path = arr_data.get('lipsync_f_s_path', 'unknown')
+                        print(f"\n[LipSync] WARNING: Failed to lazy-load lipsync features: {_e}")
+                        print(f"  Bad path: {_bad_path!r}")
+                        print(f"  Rebuild the PKL with correct paths (see Cell FIX in notebook).\n")
 
         elif self.use_lip_sync_loss:
             data_dict['lipsync_valid'] = False

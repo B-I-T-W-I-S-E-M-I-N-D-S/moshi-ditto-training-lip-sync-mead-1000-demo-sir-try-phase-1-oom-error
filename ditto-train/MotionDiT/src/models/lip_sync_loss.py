@@ -300,37 +300,35 @@ class LipSyncLoss(nn.Module):
         lip_w: int = 96,
         num_frames: int = 16,
         max_shift: int = 3,
+        force_cpu_render: bool = False,   # set True only on GPUs with <30GB VRAM (4090)
     ):
         super().__init__()
 
         self.device         = device
         self.lip_h          = lip_h
         self.lip_w          = lip_w
-        self.num_frames     = num_frames     # render window (training supervision)
+        self.num_frames     = num_frames
         self.max_shift      = max_shift
-        self.syncnet_frames = SYNCNET_FRAMES # always 5 — SyncNet architecture constraint
+        self.syncnet_frames = SYNCNET_FRAMES
 
-        # Center offset: where the 5-frame SyncNet window sits inside the render window
-        # e.g. num_frames=16 → center_offset=5  (frames 5..9 of the 16-frame render)
         self.center_offset  = max(0, (num_frames - self.syncnet_frames) // 2)
 
         from .syncnet import load_syncnet
-        # Both SyncNet and FrozenRenderer run entirely on CPU.
-        # The whole lipsync pipeline (render → lip crop → SyncNet → loss)
-        # runs on CPU. Only the final scalar loss moves to GPU.
-        # This uses ZERO GPU VRAM for lipsync, solving OOM permanently.
-        # Gradient flows: GPU x_recon → .cpu() → CPU pipeline → CPU loss scalar
-        #                 → .to(device) → added to GPU main loss → .backward()
-        self.syncnet  = load_syncnet(syncnet_ckpt, 'cpu')
-        self.renderer = FrozenRenderer(warp_ckpt, decoder_ckpt, 'cpu')
-        self._cpu = torch.device('cpu')
+
+        # Renderer and SyncNet run on the SAME device as training by default.
+        # Pass force_cpu_render=True only on cards with <30GB VRAM (RTX 4090).
+        self._render_on_cpu = force_cpu_render
+        render_dev = 'cpu' if force_cpu_render else device
+
+        self.syncnet  = load_syncnet(syncnet_ckpt, render_dev)
+        self.renderer = FrozenRenderer(warp_ckpt, decoder_ckpt, render_dev)
 
         self.cos_sim  = nn.CosineSimilarity(dim=1, eps=1e-6)
 
-        print(f"[LipSyncLoss] render_window={num_frames}  syncnet_frames={SYNCNET_FRAMES}  "
+        print(f"[LipSyncLoss] render_device={'CPU' if force_cpu_render else device}  "
+              f"render_window={num_frames}  syncnet_frames={SYNCNET_FRAMES}  "
               f"center_offset={self.center_offset}  max_shift={max_shift}")
 
-        # Warn once if lmk is unavailable
         self._lmk_warned = False
 
     # -----------------------------------------------------------------------
@@ -340,28 +338,51 @@ class LipSyncLoss(nn.Module):
     def render_frames(self, pred_motion_window, kp_canonical, f_s, x_s,
                       grad_frame_range=None):
         """
-        Render on CPU. pred_motion_window arrives as CPU tensor.
-        Returns tensor on CPU. Final loss scalar is moved to GPU in forward().
+        Render frames on render_device (auto-detected: GPU for A100, CPU for 4090).
+        Returns (B, T, 3, H, W) tensor on render_device.
+        Post-render resize to 256×256 reduces memory without affecting sync quality.
         """
         B, T, _ = pred_motion_window.shape
-        f_s_cpu  = f_s.cpu()
-        x_s_cpu  = x_s.cpu()
+
+        if self._render_on_cpu:
+            # CPU path: move inputs to CPU, render, return CPU tensor
+            pred_r = pred_motion_window.cpu()
+            kp_r   = kp_canonical.cpu()
+            f_s_r  = f_s.cpu()
+            x_s_r  = x_s.cpu()
+        else:
+            # GPU path: inputs already on GPU
+            pred_r = pred_motion_window
+            kp_r   = kp_canonical
+            f_s_r  = f_s
+            x_s_r  = x_s
 
         rendered_list = []
         for t in range(T):
-            motion_t = pred_motion_window[:, t, :]
-            x_d      = motion_vec_to_keypoints(motion_t, kp_canonical.cpu())
+            motion_t = pred_r[:, t, :]
+            x_d      = motion_vec_to_keypoints(motion_t, kp_r)
 
             needs_grad = (grad_frame_range is None or
                           grad_frame_range[0] <= t <= grad_frame_range[1])
             if needs_grad:
-                frame = self.renderer(f_s_cpu, x_s_cpu, x_d)
+                frame = self.renderer(f_s_r, x_s_r, x_d)
             else:
                 with torch.no_grad():
-                    frame = self.renderer(f_s_cpu, x_s_cpu, x_d)
+                    frame = self.renderer(f_s_r, x_s_r, x_d)
             rendered_list.append(frame)
 
-        return torch.stack(rendered_list, dim=1)   # (B, T, 3, H, W) on CPU
+        rendered = torch.stack(rendered_list, dim=1)  # (B, T, 3, H, W)
+
+        # Resize to 256×256 if larger — saves memory, doesn't affect 48×96 lip crop
+        if rendered.shape[-1] > 256:
+            import torch.nn.functional as _F
+            B_, T_, C_, H_, W_ = rendered.shape
+            rendered = _F.interpolate(
+                rendered.view(B_ * T_, C_, H_, W_),
+                size=(256, 256), mode='bilinear', align_corners=False,
+            ).view(B_, T_, C_, 256, 256)
+
+        return rendered
 
     # -----------------------------------------------------------------------
     # Delay-aware penalty (B) — on-the-fly rendering at ±max_shift
@@ -503,14 +524,16 @@ class LipSyncLoss(nn.Module):
         SF      = self.syncnet_frames                  # always 5 — SyncNet constraint
         T_ext   = T + 2 * self.max_shift               # extended length for delay-aware
 
-        # ── Move ALL inputs to CPU — entire lipsync pipeline runs on CPU ──
-        # This uses ZERO GPU VRAM. Only scalar loss is moved to GPU at the end.
-        pred_motion_window = pred_motion_window.cpu()
-        kp_canonical       = kp_canonical.cpu()
-        f_s                = f_s.cpu()
-        x_s                = x_s.cpu()
-        syncnet_A          = syncnet_A.cpu()
-        sim_gt             = sim_gt.cpu()
+        # ── Move inputs to render device (CPU for 4090, GPU for A100) ──
+        if self._render_on_cpu:
+            pred_motion_window = pred_motion_window.cpu()
+            kp_canonical       = kp_canonical.cpu()
+            f_s                = f_s.cpu()
+            x_s                = x_s.cpu()
+            syncnet_A          = syncnet_A.cpu()
+            sim_gt             = sim_gt.cpu()
+
+        # On GPU path, inputs are already on self.device — no movement needed.
 
         # Validate / pad window length
         if pred_motion_window.shape[1] != T_ext:
@@ -565,13 +588,13 @@ class LipSyncLoss(nn.Module):
             float(l_sync.detach()), hard_mode, hard_cap, hard_min_weight
         )
 
-        # 6. Delay-aware penalty (on CPU)
+        # 6. Delay-aware penalty
         if use_delay_aware and self.max_shift > 0:
             delay_penalty, best_shift, sim_best = self._delay_aware_penalty(
                 rendered_ext, syncnet_A, sim_per_sample, B
             )
         else:
-            delay_penalty = torch.tensor(0.0)   # CPU scalar
+            delay_penalty = torch.tensor(0.0)   # will be moved to GPU below
             best_shift    = 0.0
             sim_best      = float(sim_per_sample.mean().detach())
 
@@ -587,7 +610,8 @@ class LipSyncLoss(nn.Module):
         else:
             lmk_loss = torch.tensor(0.0)  # CPU scalar
 
-        # ── Move loss scalars to GPU for addition with main training loss ──
+        # ── Move scalar losses to the training GPU ──
+        # (no-op when already on GPU i.e. A100 path)
         dev = self.device
         return (
             l_sync.to(dev),
